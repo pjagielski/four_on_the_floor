@@ -9,6 +9,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 use std::env;
+use midir::{MidiOutput, MidiOutputConnection};
 
 use ctrlc;
 
@@ -64,12 +65,28 @@ pub struct Pattern {
     pub duration: f32,
 }
 
-/// Stub for MIDI (unused in this example).
-fn play_midi_note(note: u8, velocity: f32, duration: f32) {
-    println!(
-        "[MIDI] Note = {}, Velocity = {:.1}, Duration = {:.2}s (stub)",
-        note, velocity, duration
-    );
+/// Plays a MIDI note using the provided MIDI connection.
+fn play_midi_note(
+    note: u8,
+    velocity: f32,
+    duration: f32,
+    midi_conn: Arc<std::sync::Mutex<MidiOutputConnection>>,
+) {
+    let velocity = (velocity.max(0.0).min(127.0)) as u8;
+
+    // MIDI Note On message
+    if let Ok(mut conn) = midi_conn.lock() {
+        let _ = conn.send(&[0x90, note, velocity]);
+        println!("[MIDI] Note On: {}, Velocity: {}, Duration: {:.2}s", note, velocity, duration);
+    }
+
+    thread::sleep(Duration::from_secs_f32(duration));
+
+    // MIDI Note Off message
+    if let Ok(mut conn) = midi_conn.lock() {
+        let _ = conn.send(&[0x80, note, 0]);
+        println!("[MIDI] Note Off: {}", note);
+    }
 }
 
 fn play_sound_label(
@@ -90,11 +107,13 @@ fn play_sound_label(
     }
 }
 
-/// Schedules patterns over a certain number of beats (like your original approach).
+use threadpool::ThreadPool;
+
 fn play_pattern_with_soundbank(
     patterns: Arc<Vec<Pattern>>,
     sound_bank: Arc<SoundBank>,
     stream_handle: Arc<OutputStreamHandle>,
+    midi_conn: Arc<std::sync::Mutex<MidiOutputConnection>>,
     bpm: u32,
     loop_beats: u32,
 ) {
@@ -103,6 +122,7 @@ fn play_pattern_with_soundbank(
     let total_eighth_beats = loop_beats * 8;
 
     let start_time = Instant::now();
+    let pool = ThreadPool::new(4); // Create a thread pool with 4 workers
 
     for i in 0..total_eighth_beats {
         let current_time_in_beats = i as f32 / 8.0;
@@ -111,13 +131,23 @@ fn play_pattern_with_soundbank(
             if pattern.beats.contains(&current_time_in_beats) {
                 let sb_clone = Arc::clone(&sound_bank);
                 let sh_clone = Arc::clone(&stream_handle);
+                let midi_conn_clone = Arc::clone(&midi_conn);
                 let sound = pattern.sound.clone();
+                let midi_note = pattern.midi_note;
+                let velocity = pattern.velocity;
+                let duration = pattern.duration;
 
-                thread::spawn(move || {
-                    if let Some(label) = sound {
+                if let Some(note) = midi_note {
+                    pool.execute(move || {
+                        play_midi_note(note, velocity, duration, midi_conn_clone);
+                    });
+                }
+
+                if let Some(label) = sound {
+                    pool.execute(move || {
                         play_sound_label(&label, &sb_clone, &sh_clone, 100.0);
-                    }
-                });
+                    });
+                }
             }
         }
 
@@ -131,6 +161,75 @@ fn play_pattern_with_soundbank(
 }
 
 
+fn generate_chord_patterns() -> Vec<Pattern> {
+    let mut patterns = Vec::new();
+
+    fn add_chord_pattern(
+        patterns: &mut Vec<Pattern>,
+        chord_notes: &[u8],
+        chord_beats: &[f32],
+        velocity: f32,
+        duration: f32,
+    ) {
+        for &note in chord_notes {
+            for &beat in chord_beats {
+                patterns.push(Pattern {
+                    sound: None,
+                    midi_note: Some(note),
+                    beats: vec![beat],
+                    velocity,
+                    duration,
+                });
+            }
+        }
+    }
+
+    // Define chords and their beats
+    let c_sharp_m = [61, 64, 68]; // C#4, E4, G#4
+    let f_sharp_m = [66, 69, 73]; // F#4, A4, C#5
+    let a_maj = [69, 73, 76];     // A4, C#5, E5
+    let b_maj = [71, 75, 78];     // B4, D#5, F#5
+
+    let c_sharp_beats = [0.0, 0.5, 1.25, 1.75];
+    let f_sharp_beats = [2.0, 2.5, 3.25, 3.75];
+    let a_beats       = [4.0, 4.5, 5.25, 5.75];
+    let b_beats       = [6.0, 6.5, 7.25, 7.75];
+
+    add_chord_pattern(&mut patterns, &c_sharp_m, &c_sharp_beats, 100.0, 0.1);
+    add_chord_pattern(&mut patterns, &f_sharp_m, &f_sharp_beats, 100.0, 0.1);
+    add_chord_pattern(&mut patterns, &a_maj, &a_beats, 100.0, 0.2);
+    add_chord_pattern(&mut patterns, &b_maj, &b_beats, 100.0, 0.2);
+
+    patterns
+}
+
+fn generate_combined_patterns() -> Vec<Pattern> {
+    let mut combined_patterns = Vec::new();
+
+    // Add beat patterns
+    combined_patterns.push(Pattern {
+        sound: Some("bd".to_string()),
+        beats: vec![0.0, 0.75, 2.0, 2.75],
+        midi_note: None,
+        velocity: 100.0,
+        duration: 0.25,
+    });
+
+    combined_patterns.push(Pattern {
+        sound: Some("sd".to_string()),
+        beats: vec![1.5, 3.5],
+        midi_note: None,
+        velocity: 100.0,
+        duration: 0.25,
+    });
+
+    // Add chord patterns
+    combined_patterns.extend(generate_chord_patterns());
+
+    combined_patterns
+}
+
+
 
 /// -------------------------------------------------------------------------
 /// 3) Main
@@ -139,29 +238,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up rodio
     let (_stream, stream_handle) = OutputStream::try_default()?;
 
+    // Set up MIDI output
+    let midi_out = MidiOutput::new("MIDI Output")?;
+    let ports = midi_out.ports();
+    let port = ports
+        .iter()
+        .find(|p| midi_out.port_name(p).map_or(false, |name| name == "IAC Driver Bus 1"))
+        .ok_or("Could not find IAC Driver Bus 1 port")?;
+    let conn = midi_out.connect(port, "IAC Driver Bus 1 Connection")?;
+    let midi_conn = Arc::new(std::sync::Mutex::new(conn));
+
     // Wrap in Arc
     let sound_bank = Arc::new(SoundBank::new()?);
     let stream_handle = Arc::new(stream_handle);
 
-    // Example patterns
-    let patterns = vec![
-        Pattern {
-            sound: Some("bd".to_string()),
-            beats: vec![0.0, 0.75, 2.0, 2.75],
-            midi_note: None,
-            velocity: 100.0,
-            duration: 0.25,
-        },
-        Pattern {
-            sound: Some("sd".to_string()),
-            beats: vec![1.5, 3.5],
-            midi_note: None,
-            velocity: 100.0,
-            duration: 0.25,
-        },
-    ];
-
-    let patterns = Arc::new(patterns);
+    let patterns = Arc::new(generate_combined_patterns());
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -189,6 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&patterns),
             Arc::clone(&sound_bank),
             Arc::clone(&stream_handle),
+            Arc::clone(&midi_conn),
             bpm,
             loop_beats,
         );
