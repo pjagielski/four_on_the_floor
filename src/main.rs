@@ -12,6 +12,9 @@ use std::env;
 use midir::{MidiOutput, MidiOutputConnection};
 
 use ctrlc;
+mod midi;
+mod model;
+use model::Pattern;
 
 /// -------------------------------------------------------------------------
 /// 1) SoundBank
@@ -38,6 +41,7 @@ impl SoundBank {
         let sound_paths = [
             ("bd".to_string(), "samples/bd.wav".to_string()),
             ("sd".to_string(), "samples/sd.wav".to_string()),
+            ("hh".to_string(), "samples/hh.wav".to_string()),
         ];
 
         for (label, path) in sound_paths {
@@ -56,14 +60,7 @@ impl SoundBank {
 /// -------------------------------------------------------------------------
 /// 2) Pattern + Playback
 /// -------------------------------------------------------------------------
-#[derive(Debug)]
-pub struct Pattern {
-    pub sound: Option<String>,
-    pub midi_note: Option<u8>,
-    pub beats: Vec<f32>,
-    pub velocity: f32,
-    pub duration: f32,
-}
+
 
 /// Plays a MIDI note using the provided MIDI connection.
 fn play_midi_note(
@@ -77,7 +74,7 @@ fn play_midi_note(
     // MIDI Note On message
     if let Ok(mut conn) = midi_conn.lock() {
         let _ = conn.send(&[0x90, note, velocity]);
-        println!("[MIDI] Note On: {}, Velocity: {}, Duration: {:.2}s", note, velocity, duration);
+        println!("[MIDI] Note On: {}, velocity: {}, duration: {:.2}s", note, velocity, duration);
     }
 
     thread::sleep(Duration::from_secs_f32(duration));
@@ -89,7 +86,7 @@ fn play_midi_note(
     }
 }
 
-fn play_sound_label(
+fn play_sound(
     label: &str,
     sound_bank: &SoundBank,
     stream_handle: &OutputStreamHandle,
@@ -145,7 +142,7 @@ fn play_pattern_with_soundbank(
 
                 if let Some(label) = sound {
                     pool.execute(move || {
-                        play_sound_label(&label, &sb_clone, &sh_clone, 100.0);
+                        play_sound(&label, &sb_clone, &sh_clone, 100.0);
                     });
                 }
             }
@@ -190,26 +187,41 @@ fn generate_chord_patterns() -> Vec<Pattern> {
     let a_maj = [69, 73, 76];     // A4, C#5, E5
     let b_maj = [71, 75, 78];     // B4, D#5, F#5
 
-    let c_sharp_beats = [0.0, 0.5, 1.25, 1.75];
-    let f_sharp_beats = [2.0, 2.5, 3.25, 3.75];
-    let a_beats       = [4.0, 4.5, 5.25, 5.75];
-    let b_beats       = [6.0, 6.5, 7.25, 7.75];
+    let c_sharp_beats = [0.25, 1.25, 1.75];
+    let f_sharp_beats = [2.25, 3.25, 3.75];
+    let a_beats       = [4.25, 5.25, 5.75];
+    let b_beats       = [6.25, 6.50, 7.25, 7.75];
 
     add_chord_pattern(&mut patterns, &c_sharp_m, &c_sharp_beats, 100.0, 0.1);
     add_chord_pattern(&mut patterns, &f_sharp_m, &f_sharp_beats, 100.0, 0.1);
-    add_chord_pattern(&mut patterns, &a_maj, &a_beats, 100.0, 0.2);
-    add_chord_pattern(&mut patterns, &b_maj, &b_beats, 100.0, 0.2);
+    add_chord_pattern(&mut patterns, &a_maj, &a_beats, 100.0, 0.1);
+    add_chord_pattern(&mut patterns, &b_maj, &b_beats, 100.0, 0.1);
 
     patterns
 }
 
-fn generate_combined_patterns() -> Vec<Pattern> {
+fn repeat(beats: &[f32], size: usize, times: usize) -> Vec<f32> {
+    // Initialize the result vector with the original beats
+    let mut repeated_beats = beats.to_vec();
+
+    // Loop to replicate beats `times` times
+    for i in 1..times {
+        let offset = size as f32 * i as f32; // Calculate the offset
+        for &b in beats {
+            repeated_beats.push(b + offset); // Add the offset to each beat
+        }
+    }
+
+    repeated_beats
+}
+
+fn generate_combined_patterns(midi_pattern: Vec<Pattern>) -> Vec<Pattern> {
     let mut combined_patterns = Vec::new();
 
     // Add beat patterns
     combined_patterns.push(Pattern {
         sound: Some("bd".to_string()),
-        beats: vec![0.0, 0.75, 2.0, 2.75],
+        beats: repeat(&vec![0.0, 0.75, 2.0, 2.75], 4, 2),
         midi_note: None,
         velocity: 100.0,
         duration: 0.25,
@@ -217,14 +229,25 @@ fn generate_combined_patterns() -> Vec<Pattern> {
 
     combined_patterns.push(Pattern {
         sound: Some("sd".to_string()),
-        beats: vec![1.5, 3.5],
+        beats: repeat(&vec![1.5, 3.5], 4, 2),
         midi_note: None,
         velocity: 100.0,
         duration: 0.25,
     });
 
+    // Create the Pattern
+    combined_patterns.push(Pattern {
+        sound: Some("hh".to_string()),
+        beats: repeat(&vec![0.5, 1.25, 1.75], 2, 4),
+        midi_note: None,
+        velocity: 50.0,
+        duration: 0.25,
+    });
+
     // Add chord patterns
     combined_patterns.extend(generate_chord_patterns());
+
+    combined_patterns.extend(midi_pattern);
 
     combined_patterns
 }
@@ -252,7 +275,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sound_bank = Arc::new(SoundBank::new()?);
     let stream_handle = Arc::new(stream_handle);
 
-    let patterns = Arc::new(generate_combined_patterns());
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -261,7 +283,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let bpm: u32 = args[1].parse()?;
 
-    let loop_beats = 4;
+    let loop_beats = 8;
+    let midi_file = "shape.mid";
+    let track_name = "Lead";
+
+    let midi_pattern = midi::read_midi_and_extract_pattern(midi_file, track_name, bpm, 20.0);
+    for pattern in &midi_pattern {
+        println!("{:?}", pattern);
+    }
+    let patterns = Arc::new(generate_combined_patterns(midi_pattern));
 
     // We'll keep looping until Ctrl+C
     let running = Arc::new(AtomicBool::new(true));
