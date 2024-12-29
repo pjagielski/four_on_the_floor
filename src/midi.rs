@@ -87,6 +87,7 @@ pub fn read_midi_and_extract_pattern(
                         if rounded_beat_start < limit_beats {
                             patterns.push(Pattern {
                                 sound: None,
+                                loop_name: None,
                                 midi_note: Some(key.as_int()),
                                 beats: vec![rounded_beat_start],
                                 velocity: velocity / 127.0 * 100.0,

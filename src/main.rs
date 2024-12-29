@@ -1,5 +1,6 @@
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::collections::HashMap;
+use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::{
@@ -14,7 +15,7 @@ use midir::{MidiOutput, MidiOutputConnection};
 use ctrlc;
 mod midi;
 mod model;
-use model::Pattern;
+use model::{Pattern, PatternBuilder};
 
 /// -------------------------------------------------------------------------
 /// 1) SoundBank
@@ -34,19 +35,47 @@ fn load_sample(path: &str) -> Result<(Vec<i16>, u16, u32), Box<dyn std::error::E
 }
 
 impl SoundBank {
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(directory: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let mut data = HashMap::new();
 
-        // Label -> WAV path
-        let sound_paths = [
-            ("bd".to_string(), "samples/bd.wav".to_string()),
-            ("sd".to_string(), "samples/sd.wav".to_string()),
-            ("hh".to_string(), "samples/hh.wav".to_string()),
-        ];
+        // Read all files in the given directory using a thread pool
+        let paths = fs::read_dir(directory)?;
+        let pool = ThreadPool::new(4);
+        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        for (label, path) in sound_paths {
-            let (samples, channels, rate) = load_sample(&path)?;
-            data.insert(label, (samples, channels, rate));
+        for path in paths {
+            let path = path?.path();
+            if let Some(extension) = path.extension() {
+                if extension == "wav" {
+                    let path_str = path.to_str().ok_or("Invalid file path")?.to_string();
+                    let results_clone = Arc::clone(&results);
+
+                    pool.execute(move || {
+                        println!("Loading {}", path_str);
+                        match load_sample(&path_str) {
+                            Ok((samples, channels, rate)) => {
+                                let label = std::path::Path::new(&path_str)
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                results_clone.lock().unwrap().push((label, (samples, channels, rate)));
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to load sample '{}': {}", path_str, e);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        // Wait for all threads to finish
+        pool.join();
+
+        // Collect results into the data map
+        for (label, data_entry) in results.lock().unwrap().drain(..) {
+            data.insert(label, data_entry);
         }
 
         Ok(SoundBank { data })
@@ -57,9 +86,122 @@ impl SoundBank {
     }
 }
 
-/// -------------------------------------------------------------------------
-/// 2) Pattern + Playback
-/// -------------------------------------------------------------------------
+
+struct LoopBank {
+    data: HashMap<String, (Vec<i16>, u16, u32, u32)>, // (samples, channels, sample_rate, beats)
+}
+
+fn load_loop(path: &str) -> Result<(Vec<i16>, u16, u32, u32, String), Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let decoder = Decoder::new(BufReader::new(file))?;
+    let channels = decoder.channels();
+    let sample_rate = decoder.sample_rate();
+    let samples: Vec<i16> = decoder.convert_samples().collect();
+
+    // Extract bpm and beats from filename
+    let filename = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("Invalid filename")?;
+
+    let parts: Vec<&str> = filename.split('_').collect();
+    if parts.len() != 3 {
+        return Err("Invalid loop filename format. Expected: bpm_beats_name.wav".into());
+    }
+
+    let bpm: u32 = parts[0].parse()?;
+    let beats: u32 = parts[1].parse()?;
+    let name: &str = parts[2];
+
+    Ok((samples, channels, sample_rate, bpm, name.to_string()))
+}
+
+
+impl LoopBank {
+    fn new(directory: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut data = HashMap::new();
+
+        // Read all files in the given directory using a thread pool
+        let paths = fs::read_dir(directory)?;
+        let pool = ThreadPool::new(16);
+        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        for path in paths {
+            let path = path?.path();
+            if let Some(extension) = path.extension() {
+                if extension == "wav" {
+                    let path_str = path.to_str().ok_or("Invalid file path")?.to_string();
+                    let results_clone = Arc::clone(&results);
+
+                    pool.execute(move || {
+                        println!("Loading {}", path_str);
+                        match load_loop(&path_str) {
+                            Ok((samples, channels, rate, total_beats, name)) => {
+                                results_clone.lock().unwrap().push((name, (samples, channels, rate, total_beats)));
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to load loop '{}': {}", path_str, e);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        // Wait for all threads to finish
+        pool.join();
+
+        // Collect results into the data map
+        for (label, data_entry) in results.lock().unwrap().drain(..) {
+            data.insert(label, data_entry);
+        }
+
+        Ok(LoopBank { data })
+    }
+
+    fn get(&self, label: &str) -> Option<&(Vec<i16>, u16, u32, u32)> {
+        self.data.get(label)
+    }
+}
+
+fn beats_to_millis(beats: f32, bpm: u32) -> u64 {
+    let minutes = beats / bpm as f32;
+    let millis = minutes * 60.0 * 1000.0;
+    millis.round() as u64
+}
+
+fn play_loop(
+    label: &str,
+    duration: f32,
+    velocity: f32,
+    loop_bank: &LoopBank,
+    stream_handle: &OutputStreamHandle,
+    project_bpm: u32,
+) {
+    if let Some((samples, channels, sample_rate, loop_bpm_beats)) = loop_bank.get(label) {
+        let original_bpm = *loop_bpm_beats;
+        let playback_speed = project_bpm as f32 / original_bpm as f32;
+        let duration_millis = beats_to_millis(duration, project_bpm);
+
+        let source = rodio::buffer::SamplesBuffer::new(*channels, *sample_rate, samples.to_vec())
+            .buffered()
+            .amplify(velocity / 100.0)
+            // .reverb(Duration::from_millis(delay as u64), 0.8) // Add delay for reverb effect
+            .take_duration(Duration::from_millis(duration_millis))
+            .speed(playback_speed); // Adjust speed for BPM
+        let sink = Sink::try_new(stream_handle).unwrap();
+        sink.append(source);
+        sink.detach();
+        println!(
+            "[Loop] Playing '{}' at project BPM {} for original {} with speed adjustment {:.2}",
+            label, project_bpm, original_bpm, playback_speed
+        );
+    } else {
+        println!("Warning: No loop label '{}' found in LoopBank", label);
+    }
+}
+
+
 
 
 /// Plays a MIDI note using the provided MIDI connection.
@@ -88,14 +230,15 @@ fn play_midi_note(
 
 fn play_sound(
     label: &str,
+    velocity: f32,
     sound_bank: &SoundBank,
     stream_handle: &OutputStreamHandle,
-    velocity: f32,
 ) {
     if let Some((samples, channels, sample_rate)) = sound_bank.get(label) {
         let sink = Sink::try_new(stream_handle).unwrap();
         let source =
-            rodio::buffer::SamplesBuffer::new(*channels, *sample_rate, samples.clone());
+            rodio::buffer::SamplesBuffer::new(*channels, *sample_rate, samples.clone())
+            .amplify(velocity / 100.0);
         sink.append(source);
         sink.detach();
         println!("[Audio] Playing '{}' at velocity {:.1}", label, velocity);
@@ -109,6 +252,7 @@ use threadpool::ThreadPool;
 fn play_pattern_with_soundbank(
     patterns: Arc<Vec<Pattern>>,
     sound_bank: Arc<SoundBank>,
+    loop_bank: Arc<LoopBank>,
     stream_handle: Arc<OutputStreamHandle>,
     midi_conn: Arc<std::sync::Mutex<MidiOutputConnection>>,
     bpm: u32,
@@ -130,6 +274,7 @@ fn play_pattern_with_soundbank(
                 let sh_clone = Arc::clone(&stream_handle);
                 let midi_conn_clone = Arc::clone(&midi_conn);
                 let sound = pattern.sound.clone();
+                let loop_name = pattern.loop_name.clone();
                 let midi_note = pattern.midi_note;
                 let velocity = pattern.velocity;
                 let duration = pattern.duration;
@@ -140,9 +285,16 @@ fn play_pattern_with_soundbank(
                     });
                 }
 
-                if let Some(label) = sound {
+                else if let Some(label) = sound {
                     pool.execute(move || {
-                        play_sound(&label, &sb_clone, &sh_clone, 100.0);
+                        play_sound(&label,  velocity, &sb_clone, &sh_clone);
+                    });
+                }
+
+                else if let Some(loop_name) = loop_name {
+                    let lb_clone = Arc::clone(&loop_bank);
+                    pool.execute(move || {
+                        play_loop(&loop_name, duration, velocity, &lb_clone, &sh_clone, bpm);
                     });
                 }
             }
@@ -172,6 +324,7 @@ fn generate_chord_patterns() -> Vec<Pattern> {
             for &beat in chord_beats {
                 patterns.push(Pattern {
                     sound: None,
+                    loop_name: None,
                     midi_note: Some(note),
                     beats: vec![beat],
                     velocity,
@@ -219,30 +372,62 @@ fn generate_combined_patterns(midi_pattern: Vec<Pattern>) -> Vec<Pattern> {
     let mut combined_patterns = Vec::new();
 
     // Add beat patterns
-    combined_patterns.push(Pattern {
-        sound: Some("bd".to_string()),
-        beats: repeat(&vec![0.0, 0.75, 2.0, 2.75], 4, 2),
-        midi_note: None,
-        velocity: 100.0,
-        duration: 0.25,
-    });
+    combined_patterns.push(PatternBuilder::new()
+        .sound("bd")
+        .beats(repeat(&vec![0.0, 0.75, 2.0, 2.75, 3.25], 4, 2))
+        // .beats(repeat(&vec![0.0, 1.0], 2, 4))
+        .velocity(60.0)
+        .build()
+    );
 
-    combined_patterns.push(Pattern {
-        sound: Some("sd".to_string()),
-        beats: repeat(&vec![1.5, 3.5], 4, 2),
-        midi_note: None,
-        velocity: 100.0,
-        duration: 0.25,
-    });
+    combined_patterns.push(PatternBuilder::new()
+        .sound("claps")
+        .beats(repeat(&vec![1.5], 4, 2))
+        .velocity(50.0)
+        .build()
+    );
 
-    // Create the Pattern
-    combined_patterns.push(Pattern {
-        sound: Some("hh".to_string()),
-        beats: repeat(&vec![0.5, 1.25, 1.75], 2, 4),
-        midi_note: None,
-        velocity: 50.0,
-        duration: 0.25,
-    });
+    combined_patterns.push(PatternBuilder::new()
+        .sound("sd")
+        .beats(repeat(&vec![3.75], 4, 2))
+        .velocity(40.0)
+        .build()
+    );
+
+    combined_patterns.push(PatternBuilder::new()
+        .sound("909ch")
+        .beats(repeat(&vec![0.5, 1.5], 2, 4))
+        .velocity(50.0)
+        .build()
+    );
+
+    combined_patterns.push(PatternBuilder::new()
+        .loop_name("dl-ethnic")
+        .beats(vec![0.0, 4.0])
+        .duration(2.0)
+        .build()
+    );
+    combined_patterns.push(PatternBuilder::new()
+        .loop_name("dl-ethnic")
+        .beats(vec![1.5, 5.5])
+        .duration(2.5)
+        .build()
+    );
+
+    // combined_patterns.push(PatternBuilder::new()
+    //     .loop_name("dhs-noise")
+    //     .beats(vec![0.0, 4.0])
+    //     .duration(3.0)
+    //     .velocity(75.0)
+    //     .build()
+    // );
+    // combined_patterns.push(PatternBuilder::new()
+    //     .loop_name("dsh-drums-5")
+    //     .beats(vec![0.0, 4.0])
+    //     .duration(3.0)
+    //     .velocity(60.0)
+    //     .build()
+    // );
 
     // Add chord patterns
     combined_patterns.extend(generate_chord_patterns());
@@ -272,9 +457,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let midi_conn = Arc::new(std::sync::Mutex::new(conn));
 
     // Wrap in Arc
-    let sound_bank = Arc::new(SoundBank::new()?);
+    let sound_bank = Arc::new(SoundBank::new("work/samples")?);
     let stream_handle = Arc::new(stream_handle);
-
+    let loop_bank = Arc::new(LoopBank::new("work/loops")?);
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -309,6 +494,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         play_pattern_with_soundbank(
             Arc::clone(&patterns),
             Arc::clone(&sound_bank),
+            Arc::clone(&loop_bank),
             Arc::clone(&stream_handle),
             Arc::clone(&midi_conn),
             bpm,
