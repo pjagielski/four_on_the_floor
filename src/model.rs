@@ -1,4 +1,6 @@
-#[derive(Debug)]
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct Pattern {
     pub sound: Option<String>,
     pub loop_name: Option<String>,

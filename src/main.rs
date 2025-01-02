@@ -1,14 +1,13 @@
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::collections::HashMap;
-use std::fs;
 use std::fs::File;
 use std::io::BufReader;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    fs,
+    sync::{Arc, RwLock, atomic::{AtomicBool, Ordering}},
+    thread,
+    time::{Duration, Instant},
 };
-use std::thread;
-use std::time::{Duration, Instant};
 use std::env;
 use midir::{MidiOutput, MidiOutputConnection};
 
@@ -16,6 +15,7 @@ use ctrlc;
 mod midi;
 mod model;
 use model::{Pattern, PatternBuilder};
+
 
 /// -------------------------------------------------------------------------
 /// 1) SoundBank
@@ -368,38 +368,10 @@ fn repeat(beats: &[f32], size: usize, times: usize) -> Vec<f32> {
     repeated_beats
 }
 
-fn generate_combined_patterns(midi_pattern: Vec<Pattern>) -> Vec<Pattern> {
+fn generate_combined_patterns(midi_pattern: Vec<Pattern>, json_patterns: Vec<Pattern>) -> Vec<Pattern> {
     let mut combined_patterns = Vec::new();
 
-    // Add beat patterns
-    combined_patterns.push(PatternBuilder::new()
-        .sound("bd")
-        .beats(repeat(&vec![0.0, 0.75, 2.0, 2.75, 3.25], 4, 2))
-        // .beats(repeat(&vec![0.0, 1.0], 2, 4))
-        .velocity(60.0)
-        .build()
-    );
-
-    combined_patterns.push(PatternBuilder::new()
-        .sound("claps")
-        .beats(repeat(&vec![1.5], 4, 2))
-        .velocity(50.0)
-        .build()
-    );
-
-    combined_patterns.push(PatternBuilder::new()
-        .sound("sd")
-        .beats(repeat(&vec![3.75], 4, 2))
-        .velocity(40.0)
-        .build()
-    );
-
-    combined_patterns.push(PatternBuilder::new()
-        .sound("909ch")
-        .beats(repeat(&vec![0.5, 1.5], 2, 4))
-        .velocity(50.0)
-        .build()
-    );
+    combined_patterns.extend(json_patterns);
 
     combined_patterns.push(PatternBuilder::new()
         .loop_name("dl-ethnic")
@@ -414,21 +386,6 @@ fn generate_combined_patterns(midi_pattern: Vec<Pattern>) -> Vec<Pattern> {
         .build()
     );
 
-    // combined_patterns.push(PatternBuilder::new()
-    //     .loop_name("dhs-noise")
-    //     .beats(vec![0.0, 4.0])
-    //     .duration(3.0)
-    //     .velocity(75.0)
-    //     .build()
-    // );
-    // combined_patterns.push(PatternBuilder::new()
-    //     .loop_name("dsh-drums-5")
-    //     .beats(vec![0.0, 4.0])
-    //     .duration(3.0)
-    //     .velocity(60.0)
-    //     .build()
-    // );
-
     // Add chord patterns
     combined_patterns.extend(generate_chord_patterns());
 
@@ -437,7 +394,70 @@ fn generate_combined_patterns(midi_pattern: Vec<Pattern>) -> Vec<Pattern> {
     combined_patterns
 }
 
+use eframe::egui;
 
+struct PatternVisualizerApp {
+    patterns: Vec<Pattern>,
+}
+
+impl eframe::App for PatternVisualizerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Patterns Grid Visualization");
+
+            let num_sub_beats = 32; // 8 beats × 4 sub-beats per beat
+            let cell_size = 20.0; // Size of each grid cell
+
+            for (row_index, pattern) in self.patterns.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    for col_index in 0..num_sub_beats {
+                        let beat = col_index as f32 * 0.25; // Convert column index to beat position
+                        let is_active = pattern.beats.contains(&beat);
+
+                        // Use a Frame to draw colored cells
+                        let color = if is_active {
+                            egui::Color32::RED // Red for active beats
+                        } else {
+                            egui::Color32::WHITE // White for inactive beats
+                        };
+
+                        egui::Frame::none()
+                            .fill(color)
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK))
+                            .show(ui, |ui| {
+                                ui.allocate_space(egui::vec2(cell_size, cell_size));
+                            });
+                    }
+                });
+
+                ui.end_row();
+            }
+        });
+    }
+}
+
+fn load_and_combine_patterns(file_path: &str, midi_pattern: &Vec<Pattern>) -> Vec<Pattern> {
+    if let Ok(file_content) = fs::read_to_string(file_path) {
+        load_and_combine_patterns_from_content(&file_content, midi_pattern)
+    } else {
+        eprintln!("Failed to read {} during initial load.", file_path);
+        generate_combined_patterns(midi_pattern.clone(), Vec::new())
+    }
+}
+
+/// Helper function to load and combine patterns from file content
+fn load_and_combine_patterns_from_content(
+    file_content: &str,
+    midi_pattern: &Vec<Pattern>,
+) -> Vec<Pattern> {
+    match serde_json::from_str::<Vec<Pattern>>(file_content) {
+        Ok(new_patterns) => generate_combined_patterns(midi_pattern.clone(), new_patterns),
+        Err(e) => {
+            eprintln!("Failed to parse JSON: {}", e);
+            generate_combined_patterns(midi_pattern.clone(), Vec::new())
+        }
+    }
+}
 
 /// -------------------------------------------------------------------------
 /// 3) Main
@@ -473,12 +493,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let track_name = "Lead";
 
     let midi_pattern = midi::read_midi_and_extract_pattern(midi_file, track_name, bpm, 20.0);
-    for pattern in &midi_pattern {
-        println!("{:?}", pattern);
-    }
-    let patterns = Arc::new(generate_combined_patterns(midi_pattern));
 
-    // We'll keep looping until Ctrl+C
+    // Atomic flag for stopping threads
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
@@ -487,12 +503,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Ctrl+C detected. Stopping loop...");
         r.store(false, Ordering::SeqCst);
     })?;
-
     println!("Press Ctrl+C to stop the loop.");
 
+    // Shared state for the patterns
+    let patterns = Arc::new(RwLock::new(Vec::new()));
+
+    {
+        let initial_patterns = load_and_combine_patterns("patterns.json", &midi_pattern);
+        let mut patterns_write = patterns.write().unwrap();
+        *patterns_write = initial_patterns;
+    }
+
+    // Start a background thread to watch for changes
+    let patterns_clone = Arc::clone(&patterns);
+    let running_clone = Arc::clone(&running);
+    let midi_pattern_clone = midi_pattern.clone(); // Clone MIDI patterns for the thread
+    thread::spawn(move || {
+        loop {
+            if running_clone.load(Ordering::SeqCst) {
+                if let Ok(file_content) = fs::read_to_string("patterns.json") {
+                    let combined_patterns = load_and_combine_patterns_from_content(
+                        &file_content,
+                        &midi_pattern_clone,
+                    );
+                    let mut patterns_write = patterns_clone.write().unwrap(); // Write lock
+                    *patterns_write = combined_patterns;
+                    println!("Patterns updated from JSON and MIDI patterns combined.");
+                } else {
+                    eprintln!("Failed to read patterns.json");
+                }
+            } else {
+                break;
+            }
+            thread::sleep(Duration::from_secs(3));
+        }
+    });
+
+    // Main loop
     while running.load(Ordering::SeqCst) {
+        let current_patterns = {
+            let patterns_lock = patterns.read().unwrap();
+            patterns_lock.clone()
+        };
         play_pattern_with_soundbank(
-            Arc::clone(&patterns),
+            Arc::new(current_patterns),
             Arc::clone(&sound_bank),
             Arc::clone(&loop_bank),
             Arc::clone(&stream_handle),
