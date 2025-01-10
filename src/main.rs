@@ -1,3 +1,4 @@
+use eframe::egui::mutex::Mutex;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::collections::HashMap;
 use std::fs::File;
@@ -251,6 +252,7 @@ use threadpool::ThreadPool;
 
 fn play_pattern_with_soundbank(
     patterns: Arc<Vec<Pattern>>,
+    current_beat: Arc<RwLock<f32>>,
     sound_bank: Arc<SoundBank>,
     loop_bank: Arc<LoopBank>,
     stream_handle: Arc<OutputStreamHandle>,
@@ -266,10 +268,14 @@ fn play_pattern_with_soundbank(
     let pool = ThreadPool::new(4); // Create a thread pool with 4 workers
 
     for i in 0..total_eighth_beats {
-        let current_time_in_beats = i as f32 / 8.0;
+        let computed_current_beat = i as f32 / 8.0;
+        {
+            let mut beat_lock = current_beat.write().unwrap();
+            *beat_lock = computed_current_beat;
+        }
 
         for pattern in patterns.iter() {
-            if pattern.beats.contains(&current_time_in_beats) {
+            if pattern.beats.contains(&computed_current_beat) {
                 let sb_clone = Arc::clone(&sound_bank);
                 let sh_clone = Arc::clone(&stream_handle);
                 let midi_conn_clone = Arc::clone(&midi_conn);
@@ -381,12 +387,12 @@ fn generate_combined_patterns(midi_pattern: Vec<Pattern>, json_patterns: Vec<Pat
     );
     combined_patterns.push(PatternBuilder::new()
         .loop_name("dl-ethnic")
-        .beats(vec![1.5, 5.5])
+        .beats(vec![1.25, 5.25])
         .duration(2.5)
         .build()
     );
 
-    // Add chord patterns
+    // // Add chord patterns
     combined_patterns.extend(generate_chord_patterns());
 
     combined_patterns.extend(midi_pattern);
@@ -396,45 +402,101 @@ fn generate_combined_patterns(midi_pattern: Vec<Pattern>, json_patterns: Vec<Pat
 
 use eframe::egui;
 
-struct PatternVisualizerApp {
-    patterns: Vec<Pattern>,
+pub struct PatternVisualizerApp {
+    patterns: Arc<RwLock<Vec<Pattern>>>,
+    current_beat: Arc<RwLock<f32>>,
+    gui_ready: Arc<AtomicBool>,
+    bpm: u32,
 }
 
-impl eframe::App for PatternVisualizerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Patterns Grid Visualization");
+impl PatternVisualizerApp {
+    pub fn new(
+        patterns: Arc<RwLock<Vec<Pattern>>>,
+        current_beat: Arc<RwLock<f32>>,
+        gui_ready: Arc<AtomicBool>,
+        bpm: u32,
+    ) -> Self {
+        Self {
+            patterns,
+            current_beat,
+            gui_ready,
+            bpm,
+        }
+    }
 
-            let num_sub_beats = 32; // 8 beats × 4 sub-beats per beat
-            let cell_size = 20.0; // Size of each grid cell
-
-            for (row_index, pattern) in self.patterns.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    for col_index in 0..num_sub_beats {
-                        let beat = col_index as f32 * 0.25; // Convert column index to beat position
-                        let is_active = pattern.beats.contains(&beat);
-
-                        // Use a Frame to draw colored cells
-                        let color = if is_active {
-                            egui::Color32::RED // Red for active beats
-                        } else {
-                            egui::Color32::WHITE // White for inactive beats
-                        };
-
-                        egui::Frame::none()
-                            .fill(color)
-                            .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK))
-                            .show(ui, |ui| {
-                                ui.allocate_space(egui::vec2(cell_size, cell_size));
-                            });
-                    }
-                });
-
-                ui.end_row();
-            }
-        });
+    pub fn update_grid(&self) -> f32 {
+        let current_beat = self.current_beat.read().unwrap();
+        *current_beat
     }
 }
+
+
+impl eframe::App for PatternVisualizerApp {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let loop_beats = 8;
+        let resolution = 0.25;
+        let total_eighth_beats = (loop_beats as f32 / resolution) as i32;
+        let current_beat = self.update_grid();
+
+        let beat_duration = 60.0 / self.bpm as f32;
+        let delay_time = Duration::from_secs_f32((beat_duration * resolution) - 0.15);
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.heading("Rust 4x4 Groovebox");
+                let spacing = ui.spacing_mut();
+                spacing.item_spacing = egui::vec2(5.0, 5.0); // No spacing between items
+
+                let cell_size = 20.0;
+
+                let sample_patterns: Vec<_> = {
+                    let patterns_lock = self.patterns.read().unwrap();
+                    patterns_lock
+                        .iter()
+                        .filter(|pattern| pattern.sound.is_some()) // Example: Filter non-empty sound
+                        .cloned()
+                        .collect()
+                };
+
+                let grid_width = 50.0 + total_eighth_beats as f32 * (cell_size + 5.0);
+                let grid_height = 100.0 + sample_patterns.len() as f32 * (cell_size + 5.0);
+        
+                // Adjust the window size to fit the grid
+                frame.set_window_size(egui::vec2(grid_width, grid_height));
+
+                for pattern in sample_patterns.iter() {
+                    ui.horizontal(|ui| {
+                        for col_index in 0..total_eighth_beats {
+                            let beat = col_index as f32 * resolution;
+                            let is_active = pattern.beats.contains(&beat);
+                            let is_playing = current_beat == beat; // Highlight current beat
+
+                            let color = if is_playing && is_active {
+                                egui::Color32::YELLOW
+                            } else if is_active {
+                                egui::Color32::RED
+                            } else {
+                                egui::Color32::WHITE
+                            };
+
+                            egui::Frame::default()
+                                .fill(color)
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK))
+                                .show(ui, |ui| {
+                                    ui.allocate_space(egui::vec2(cell_size, cell_size));
+                                });
+                        }
+                    });
+                }
+            });
+        });
+        self.gui_ready.store(true, Ordering::SeqCst);
+        std::thread::sleep(delay_time);
+        ctx.request_repaint(); // Ensure continuous UI updates
+    }
+}
+
+
 
 fn load_and_combine_patterns(file_path: &str, midi_pattern: &Vec<Pattern>) -> Vec<Pattern> {
     if let Ok(file_content) = fs::read_to_string(file_path) {
@@ -539,23 +601,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Main loop
-    while running.load(Ordering::SeqCst) {
-        let current_patterns = {
-            let patterns_lock = patterns.read().unwrap();
-            patterns_lock.clone()
-        };
-        play_pattern_with_soundbank(
-            Arc::new(current_patterns),
-            Arc::clone(&sound_bank),
-            Arc::clone(&loop_bank),
-            Arc::clone(&stream_handle),
-            Arc::clone(&midi_conn),
-            bpm,
-            loop_beats,
-        );
-    }
+    let current_beat = Arc::new(RwLock::new(0.0)); // Shared state for the current beat
+    let gui_current_beat = Arc::clone(&current_beat);
+    let gui_patterns = Arc::clone(&patterns);
+    let gui_ready = Arc::new(AtomicBool::new(false)); // Flag to signal when GUI is ready
+    let playback_gui_ready = Arc::clone(&gui_ready);
 
-    println!("All done. Exiting now...");
+    std::thread::spawn(move || {
+        while running.load(Ordering::SeqCst) {
+            // Load the current patterns
+            let current_patterns = {
+                let patterns_lock = patterns.read().unwrap();
+                patterns_lock.clone()
+            };
+
+            while !playback_gui_ready.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            println!("Starting playback");
+
+            // Play the pattern with the sound bank
+            play_pattern_with_soundbank(
+                Arc::new(current_patterns),
+                Arc::clone(&current_beat),
+                Arc::clone(&sound_bank),
+                Arc::clone(&loop_bank),
+                Arc::clone(&stream_handle),
+                Arc::clone(&midi_conn),
+                bpm,
+                loop_beats,
+            );
+        }
+    });
+
+    // Create the GUI app
+    let app = PatternVisualizerApp::new(
+        Arc::clone(&gui_patterns), 
+        Arc::clone(&gui_current_beat), 
+        Arc::clone(&gui_ready),
+        bpm,
+    );
+    let options = eframe::NativeOptions::default();
+
+    // Run the GUI
+    let result = eframe::run_native(
+        "Pattern Visualizer", 
+        options, 
+        Box::new(move |_cc| {
+            Box::new(app)
+        }
+    ));
+
+    println!("All done. Exiting now... {}", result.is_err());
     Ok(())
 }
