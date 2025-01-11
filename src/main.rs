@@ -1,5 +1,6 @@
 use eframe::egui::mutex::Mutex;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -521,10 +522,28 @@ fn load_and_combine_patterns_from_content(
     }
 }
 
+#[derive(Deserialize)]
+struct Config {
+    midi_port: String,
+    midi_file: String,
+    track_name: String,
+    limit_beats: f32,
+}
+
+fn read_config(file_path: &str) -> Result<Config, Box<dyn std::error::Error>> {
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+    let config: Config = serde_json::from_reader(reader)?;
+    Ok(config)
+}
+
 /// -------------------------------------------------------------------------
 /// 3) Main
 /// -------------------------------------------------------------------------
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Read config
+    let config = read_config("config.json")?;
+
     // Set up rodio
     let (_stream, stream_handle) = OutputStream::try_default()?;
 
@@ -533,9 +552,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ports = midi_out.ports();
     let port = ports
         .iter()
-        .find(|p| midi_out.port_name(p).map_or(false, |name| name == "IAC Driver Bus 1"))
-        .ok_or("Could not find IAC Driver Bus 1 port")?;
-    let conn = midi_out.connect(port, "IAC Driver Bus 1 Connection")?;
+        .find(|p| midi_out.port_name(p).map_or(false, |name| name == config.midi_port))
+        .ok_or(format!("Could not find {} port", config.midi_port))?;
+    let conn = midi_out.connect(port, &config.midi_port)?;
     let midi_conn = Arc::new(std::sync::Mutex::new(conn));
 
     // Wrap in Arc
@@ -545,17 +564,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <BPM>", args[0]);
+        eprintln!("Usage: {} <BPM> [--no-gui]", args[0]);
         std::process::exit(1);
     }
     let bpm: u32 = args[1].parse()?;
+    let show_gui = !args.contains(&"--no-gui".to_string());
 
     let loop_beats = 8;
-    let midi_file = "shape.mid";
-    let track_name = "Lead";
-
-    let midi_pattern = midi::read_midi_and_extract_pattern(midi_file, track_name, bpm, 20.0);
-
+    let midi_pattern = midi::read_midi_and_extract_pattern(
+        &config.midi_file,
+        &config.track_name,
+        bpm,
+        config.limit_beats,
+    );
+    
     // Atomic flag for stopping threads
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -607,7 +629,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gui_ready = Arc::new(AtomicBool::new(false)); // Flag to signal when GUI is ready
     let playback_gui_ready = Arc::clone(&gui_ready);
 
-    std::thread::spawn(move || {
+    let playback_handle = std::thread::spawn(move || {
         while running.load(Ordering::SeqCst) {
             // Load the current patterns
             let current_patterns = {
@@ -635,24 +657,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Create the GUI app
-    let app = PatternVisualizerApp::new(
-        Arc::clone(&gui_patterns), 
-        Arc::clone(&gui_current_beat), 
-        Arc::clone(&gui_ready),
-        bpm,
-    );
-    let options = eframe::NativeOptions::default();
+    if show_gui {
+        // Create the GUI app
+        let app = PatternVisualizerApp::new(
+            Arc::clone(&gui_patterns), 
+            Arc::clone(&gui_current_beat), 
+            Arc::clone(&gui_ready),
+            bpm,
+        );
+        let options = eframe::NativeOptions::default();
 
-    // Run the GUI
-    let result = eframe::run_native(
-        "Pattern Visualizer", 
-        options, 
-        Box::new(move |_cc| {
-            Box::new(app)
-        }
-    ));
+        // Run the GUI
+        let result = eframe::run_native(
+            "Pattern Visualizer", 
+            options, 
+            Box::new(move |_cc| {
+                Box::new(app)
+            }
+        ));
+        println!("All done. Exiting now... {}", result.is_err());
+    } else {
+        gui_ready.store(true, Ordering::SeqCst);
+    }
 
-    println!("All done. Exiting now... {}", result.is_err());
+    match playback_handle.join() {
+        Ok(_) => println!("Playback finished"),
+        Err(e) => println!("Playback encountered an error: {:?}", e),
+    }
+
     Ok(())
 }

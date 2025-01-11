@@ -1,0 +1,6 @@
+{
+    "midi_port": "IAC Driver Bus 1",
+    "midi_file": "shape.mid",
+    "track_name": "Lead",
+    "limit_beats": 20.0
+}
