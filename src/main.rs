@@ -1,6 +1,4 @@
-use eframe::egui::mutex::Mutex;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -16,7 +14,10 @@ use midir::{MidiOutput, MidiOutputConnection};
 use ctrlc;
 mod midi;
 mod model;
+mod config;
+
 use model::{Pattern, PatternBuilder};
+use config::Config;
 
 
 /// -------------------------------------------------------------------------
@@ -112,7 +113,6 @@ fn load_loop(path: &str) -> Result<(Vec<i16>, u16, u32, u32, String), Box<dyn st
     }
 
     let bpm: u32 = parts[0].parse()?;
-    let beats: u32 = parts[1].parse()?;
     let name: &str = parts[2];
 
     Ok((samples, channels, sample_rate, bpm, name.to_string()))
@@ -522,27 +522,12 @@ fn load_and_combine_patterns_from_content(
     }
 }
 
-#[derive(Deserialize)]
-struct Config {
-    midi_port: String,
-    midi_file: String,
-    track_name: String,
-    limit_beats: f32,
-}
-
-fn read_config(file_path: &str) -> Result<Config, Box<dyn std::error::Error>> {
-    let file = File::open(file_path)?;
-    let reader = BufReader::new(file);
-    let config: Config = serde_json::from_reader(reader)?;
-    Ok(config)
-}
-
 /// -------------------------------------------------------------------------
 /// 3) Main
 /// -------------------------------------------------------------------------
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read config
-    let config = read_config("config.json")?;
+    let config = config::read_config("config.json")?;
 
     // Set up rodio
     let (_stream, stream_handle) = OutputStream::try_default()?;
@@ -558,9 +543,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let midi_conn = Arc::new(std::sync::Mutex::new(conn));
 
     // Wrap in Arc
-    let sound_bank = Arc::new(SoundBank::new("work/samples")?);
+    let sound_bank: Arc<SoundBank> = Arc::new(SoundBank::new(&config.sounds.samples)?);
     let stream_handle = Arc::new(stream_handle);
-    let loop_bank = Arc::new(LoopBank::new("work/loops")?);
+    let loop_bank = Arc::new(LoopBank::new(&config.sounds.loops)?);
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -572,10 +557,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let loop_beats = 8;
     let midi_pattern = midi::read_midi_and_extract_pattern(
-        &config.midi_file,
-        &config.track_name,
+        &config.midi_track.midi_file,
+        &config.midi_track.track_name,
         bpm,
-        config.limit_beats,
+        config.midi_track.limit_beats,
     );
     
     // Atomic flag for stopping threads
