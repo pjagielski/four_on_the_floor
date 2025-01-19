@@ -15,9 +15,10 @@ use ctrlc;
 mod midi;
 mod model;
 mod config;
+mod grid;
 
 use model::{Pattern, PatternBuilder};
-use config::Config;
+use grid::PatternVisualizerApp;
 
 
 /// -------------------------------------------------------------------------
@@ -316,8 +317,7 @@ fn play_pattern_with_soundbank(
     }
 }
 
-
-fn generate_chord_patterns() -> Vec<Pattern> {
+fn generate_shape_patterns() -> Vec<Pattern> {
     let mut patterns = Vec::new();
 
     fn add_chord_pattern(
@@ -360,144 +360,40 @@ fn generate_chord_patterns() -> Vec<Pattern> {
     patterns
 }
 
-fn repeat(beats: &[f32], size: usize, times: usize) -> Vec<f32> {
-    // Initialize the result vector with the original beats
-    let mut repeated_beats = beats.to_vec();
-
-    // Loop to replicate beats `times` times
-    for i in 1..times {
-        let offset = size as f32 * i as f32; // Calculate the offset
-        for &b in beats {
-            repeated_beats.push(b + offset); // Add the offset to each beat
-        }
-    }
-
-    repeated_beats
-}
 
 fn generate_combined_patterns(midi_pattern: Vec<Pattern>, json_patterns: Vec<Pattern>) -> Vec<Pattern> {
     let mut combined_patterns = Vec::new();
 
     combined_patterns.extend(json_patterns);
 
-    combined_patterns.push(PatternBuilder::new()
-        .loop_name("dl-ethnic")
-        .beats(vec![0.0, 4.0])
-        .duration(2.0)
-        .build()
-    );
-    combined_patterns.push(PatternBuilder::new()
-        .loop_name("dl-ethnic")
-        .beats(vec![1.25, 5.25])
-        .duration(2.5)
-        .build()
-    );
+    // combined_patterns.push(PatternBuilder::new()
+    //     .loop_name("dl-icarus")
+    //     .beats(vec![0.0, 8.0])
+    //     .duration(8.0)
+    //     .velocity(35.0)
+    //     .build()
+    // );
+
+    // combined_patterns.push(PatternBuilder::new()
+    //     .loop_name("dl-ethnic")
+    //     .beats(vec![0.0, 4.0, 8.0, 12.0])
+    //     .duration(2.0)
+    //     .build()
+    // );
+    // combined_patterns.push(PatternBuilder::new()
+    //     .loop_name("dl-ethnic")
+    //     .beats(vec![1.25, 5.25, 9.25, 13.25])
+    //     .duration(2.5)
+    //     .build()
+    // );
 
     // // Add chord patterns
-    combined_patterns.extend(generate_chord_patterns());
+    // combined_patterns.extend(generate_shape_patterns());
 
     combined_patterns.extend(midi_pattern);
 
     combined_patterns
 }
-
-use eframe::egui;
-
-pub struct PatternVisualizerApp {
-    patterns: Arc<RwLock<Vec<Pattern>>>,
-    current_beat: Arc<RwLock<f32>>,
-    gui_ready: Arc<AtomicBool>,
-    bpm: u32,
-}
-
-impl PatternVisualizerApp {
-    pub fn new(
-        patterns: Arc<RwLock<Vec<Pattern>>>,
-        current_beat: Arc<RwLock<f32>>,
-        gui_ready: Arc<AtomicBool>,
-        bpm: u32,
-    ) -> Self {
-        Self {
-            patterns,
-            current_beat,
-            gui_ready,
-            bpm,
-        }
-    }
-
-    pub fn update_grid(&self) -> f32 {
-        let current_beat = self.current_beat.read().unwrap();
-        *current_beat
-    }
-}
-
-
-impl eframe::App for PatternVisualizerApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let loop_beats = 8;
-        let resolution = 0.25;
-        let total_eighth_beats = (loop_beats as f32 / resolution) as i32;
-        let current_beat = self.update_grid();
-
-        let beat_duration = 60.0 / self.bpm as f32;
-        let delay_time = Duration::from_secs_f32((beat_duration * resolution) - 0.15);
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.heading("Rust 4x4 Groovebox");
-                let spacing = ui.spacing_mut();
-                spacing.item_spacing = egui::vec2(5.0, 5.0); // No spacing between items
-
-                let cell_size = 20.0;
-
-                let sample_patterns: Vec<_> = {
-                    let patterns_lock = self.patterns.read().unwrap();
-                    patterns_lock
-                        .iter()
-                        .filter(|pattern| pattern.sound.is_some()) // Example: Filter non-empty sound
-                        .cloned()
-                        .collect()
-                };
-
-                let grid_width = 50.0 + total_eighth_beats as f32 * (cell_size + 5.0);
-                let grid_height = 100.0 + sample_patterns.len() as f32 * (cell_size + 5.0);
-        
-                // Adjust the window size to fit the grid
-                frame.set_window_size(egui::vec2(grid_width, grid_height));
-
-                for pattern in sample_patterns.iter() {
-                    ui.horizontal(|ui| {
-                        for col_index in 0..total_eighth_beats {
-                            let beat = col_index as f32 * resolution;
-                            let is_active = pattern.beats.contains(&beat);
-                            let is_playing = current_beat == beat; // Highlight current beat
-
-                            let color = if is_playing && is_active {
-                                egui::Color32::YELLOW
-                            } else if is_active {
-                                egui::Color32::RED
-                            } else {
-                                egui::Color32::WHITE
-                            };
-
-                            egui::Frame::default()
-                                .fill(color)
-                                .stroke(egui::Stroke::new(1.0, egui::Color32::BLACK))
-                                .show(ui, |ui| {
-                                    ui.allocate_space(egui::vec2(cell_size, cell_size));
-                                });
-                        }
-                    });
-                }
-            });
-        });
-        self.gui_ready.store(true, Ordering::SeqCst);
-        std::thread::sleep(delay_time);
-        ctx.request_repaint(); // Ensure continuous UI updates
-    }
-}
-
-
 
 fn load_and_combine_patterns(file_path: &str, midi_pattern: &Vec<Pattern>) -> Vec<Pattern> {
     if let Ok(file_content) = fs::read_to_string(file_path) {
@@ -555,13 +451,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bpm: u32 = args[1].parse()?;
     let show_gui = !args.contains(&"--no-gui".to_string());
 
-    let loop_beats = 8;
+    let loop_beats = config.loop_beats;
     let midi_pattern = midi::read_midi_and_extract_pattern(
         &config.midi_track.midi_file,
         &config.midi_track.track_name,
         bpm,
-        config.midi_track.limit_beats,
+        config.midi_track.start_beat,
+        config.midi_track.end_beat,
     );
+
+    println!("Midi pattern {:?}", midi_pattern);
     
     // Atomic flag for stopping threads
     let running = Arc::new(AtomicBool::new(true));

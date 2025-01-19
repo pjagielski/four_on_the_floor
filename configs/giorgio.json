@@ -1,12 +1,12 @@
 {
     "midi_port": "IAC Driver Bus 1",
     "midi_track": {
-        "midi_file": "midi/shape.mid",
-        "track_name": "Lead",
-        "start_beat": 0.0,
+        "midi_file": "midi/giorgio.mid",
+        "track_name": "Track 1",
+        "start_beat": 4.0,
         "end_beat": 20.0
     },
-    "loop_beats": 8,
+    "loop_beats": 16,
     "sounds": {
         "samples": "sounds/samples",
         "loops": "sounds/loops"

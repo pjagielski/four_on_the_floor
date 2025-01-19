@@ -6,7 +6,8 @@ use serde::Deserialize;
 pub struct MidiTrackConfig {
     pub midi_file: String,
     pub track_name: String,
-    pub limit_beats: f32,
+    pub start_beat: f32,
+    pub end_beat: f32,
 }
 
 #[derive(Deserialize)]
@@ -20,6 +21,7 @@ pub struct Config {
     pub midi_port: String,
     pub midi_track: MidiTrackConfig,
     pub sounds: SoundConfig,
+    pub loop_beats: u32,
 }
 
 pub fn read_config(file_path: &str) -> Result<Config, Box<dyn std::error::Error>> {
